@@ -424,15 +424,57 @@ public class Sigga extends GhidraScript {
                     String finalSig = trimTrailingWildcards(currentSig);
                     
                     // Found a unique sig. Classify it.
-                    boolean solidHead = !isHeadWeak(tokens, i);
-                    String tier = solidHead ? "Tier 1 (High Stability, Direct)" : "Tier 2 (High Stability, Loose Head)";
-                    int quality = solidHead ? 100 : 90;
+                    int quality = calculateQuality(tokens, i, byteCount);
+                    String tier;
+                    if (quality >= 95) tier = "Tier 1 (High Stability, Direct)";
+                    else if (quality >= 80) tier = "Tier 2 (Medium Stability, Loose Head)";
+                    else tier = "Tier 4 (Low Stability)";
                     
                     return new SigResult(finalSig, startAddr, i, quality, tier);
                 }
             }
         }
         return null;
+    }
+
+    private int calculateQuality(List<String> tokens, int startIndex, int length) {
+        if (length == 0) return 0;
+
+        // Base score starts at 100
+        double score = 100.0;
+
+        // 1. Head stability (Crucial)
+        if (isWildcard(tokens.get(startIndex))) {
+            score -= 20.0; // Leading wildcard is a major penalty
+        } else {
+            // Check density of the first 4 bytes
+            int headCheck = Math.min(4, length);
+            int headWildcards = 0;
+            for (int k = 0; k < headCheck; k++) {
+                if (isWildcard(tokens.get(startIndex + k))) headWildcards++;
+            }
+            if (headWildcards > 0) score -= (headWildcards * 5.0);
+        }
+
+        // 2. Overall density (Ratio of concrete bytes)
+        int totalWildcards = 0;
+        for (int k = 0; k < length; k++) {
+            if (isWildcard(tokens.get(startIndex + k))) totalWildcards++;
+        }
+        double density = (double) (length - totalWildcards) / length;
+        
+        // We want a high density. If density is low, penalize.
+        if (density < 0.5) score -= 15.0;
+        if (density < 0.3) score -= 15.0;
+
+        // 3. Length bonus (Slightly favor longer signatures for uniqueness insurance)
+        if (length > 15) score += 5.0;
+
+        return (int) Math.max(0, Math.min(100, score));
+    }
+
+    private boolean isWildcard(String token) {
+        return token.equals("?") || token.equals("??") || token.equals(WILDCARD);
     }
 
     private String trimTrailingWildcards(String sig) {
