@@ -45,6 +45,7 @@ public class Sigga extends GhidraScript {
     private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
     private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
     private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
+    private boolean IGNORE_COMPARISONS = false; // Wildcard CMP/TEST instructions
     private String WILDCARD = "?";
 
     /**
@@ -200,6 +201,7 @@ public class Sigga extends GhidraScript {
             JSpinner spHeadSpan = new JSpinner(new SpinnerNumberModel(HEAD_CHECK_SPAN, 1, 32, 1));
             JSpinner spXrefCtx = new JSpinner(new SpinnerNumberModel(XREF_CONTEXT_INSTRUCTIONS, 1, 64, 1));
             JSpinner spMaxOffset = new JSpinner(new SpinnerNumberModel(MAX_START_OFFSET, 1, 4096, 8));
+            JCheckBox cbIgnoreComp = new JCheckBox("Ignore Comparisons (CMP, TEST)", IGNORE_COMPARISONS);
             JComboBox<String> cbWildcard = new JComboBox<>(new String[] { "?", "??" });
             cbWildcard.setSelectedItem(WILDCARD);
 
@@ -219,6 +221,8 @@ public class Sigga extends GhidraScript {
             configPanel.add(spMaxOffset);
             configPanel.add(new JLabel("Wildcard style:"));
             configPanel.add(cbWildcard);
+            configPanel.add(new JLabel("Optimization bypass:"));
+            configPanel.add(cbIgnoreComp);
 
             cfgCustom.addActionListener(e -> { configPanel.setVisible(true); dialog.pack(); });
             cfgDefault.addActionListener(e -> { configPanel.setVisible(false); dialog.pack(); });
@@ -263,6 +267,7 @@ public class Sigga extends GhidraScript {
                     XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
                     MAX_START_OFFSET = (int) spMaxOffset.getValue();
                     WILDCARD = (String) cbWildcard.getSelectedItem();
+                    IGNORE_COMPARISONS = cbIgnoreComp.isSelected();
                 }
                 confirmed[0] = true;
                 dialog.dispose();
@@ -551,6 +556,10 @@ public class Sigga extends GhidraScript {
                 // 3. Mask branches (JMP/CALL/JCC) which always carry variable displacements
                 maskBranches(insn, tokens);
 
+                if (IGNORE_COMPARISONS) {
+                    maskComparisons(insn, tokens);
+                }
+
                 if (profile == MaskProfile.STRICT) {
                     // 4. Aggressively mask operands that reference data/external symbols
                     maskOperandsSmart(insn, tokens);
@@ -602,6 +611,15 @@ public class Sigga extends GhidraScript {
                 if (!tokens[1].equals(WILDCARD) && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
                     for (int i = 2; i < tokens.length; i++) tokens[i] = WILDCARD;
                 }
+            }
+        }
+    }
+
+    private void maskComparisons(Instruction insn, String[] tokens) {
+        String mnemonic = insn.getMnemonicString().toUpperCase();
+        if (mnemonic.startsWith("CMP") || mnemonic.startsWith("TEST")) {
+            for (int i = 0; i < tokens.length; i++) {
+                tokens[i] = WILDCARD;
             }
         }
     }
