@@ -40,17 +40,30 @@ public class Sigga extends GhidraScript {
     // --- CONFIGURATION (defaults, overridable via dialog) ---
     private int MAX_INSTRUCTIONS_TO_SCAN = 200;
     private int MIN_WINDOW_BYTES = 5;       // Minimum length of a sig
+    private int MIN_WINDOW_INSTRUCTIONS = 1; // Minimum number of instructions in a sig
     private int MAX_WINDOW_BYTES = 128;     // Maximum length of a sig
     private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
     private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
     private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
+    private String WILDCARD = "?";
+
+    /**
+     * Enum to control the overall masking strategy.
+     */
+    private enum MaskingStrategy {
+        SMART,    // Tries multiple tiers (Strict -> XRef -> Minimal)
+        SKELETON  // Paranoid mode: keeps only the first byte of every instruction
+    }
+
+    private MaskingStrategy SELECTED_STRATEGY = MaskingStrategy.SMART;
 
     /**
      * Enum to control how aggressive the masking logic is.
      */
     private enum MaskProfile {
         STRICT,    // Mask anything that looks like an address, offset, or variable (Best for patches)
-        MINIMAL    // Only mask relocations and direct branches (Desperation mode)
+        MINIMAL,   // Only mask relocations and direct branches (Desperation mode)
+        SKELETON   // Keep only the first byte of each instruction (Paranoid mode)
     }
 
     /**
@@ -153,6 +166,17 @@ public class Sigga extends GhidraScript {
             modePanel.add(fromFuncStart);
             modePanel.add(fromCursor);
 
+            // --- Masking Strategy panel ---
+            JPanel strategyPanel = new JPanel(new GridLayout(2, 1, 4, 4));
+            strategyPanel.setBorder(BorderFactory.createTitledBorder("Masking Logic"));
+            JRadioButton strategySmart = new JRadioButton("Smart (Strict -> XRef -> Minimal)", true);
+            JRadioButton strategySkeleton = new JRadioButton("Skeleton (First-Byte-Only)");
+            ButtonGroup strategyGroup = new ButtonGroup();
+            strategyGroup.add(strategySmart);
+            strategyGroup.add(strategySkeleton);
+            strategyPanel.add(strategySmart);
+            strategyPanel.add(strategySkeleton);
+
             // --- Configuration mode selector ---
             JPanel configModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
             configModePanel.add(new JLabel("Scan profile:  "));
@@ -165,21 +189,26 @@ public class Sigga extends GhidraScript {
             configModePanel.add(cfgCustom);
 
             // --- Configuration panel (hidden by default) ---
-            JPanel configPanel = new JPanel(new GridLayout(6, 2, 6, 4));
+            JPanel configPanel = new JPanel(new GridLayout(8, 2, 6, 4));
             configPanel.setBorder(BorderFactory.createTitledBorder("Configuration"));
             configPanel.setVisible(false);
 
             JSpinner spMaxInstr = new JSpinner(new SpinnerNumberModel(MAX_INSTRUCTIONS_TO_SCAN, 1, 10000, 10));
             JSpinner spMinWindow = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_BYTES, 1, 256, 1));
+            JSpinner spMinInstrWin = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_INSTRUCTIONS, 1, 500, 1));
             JSpinner spMaxWindow = new JSpinner(new SpinnerNumberModel(MAX_WINDOW_BYTES, 1, 1024, 8));
             JSpinner spHeadSpan = new JSpinner(new SpinnerNumberModel(HEAD_CHECK_SPAN, 1, 32, 1));
             JSpinner spXrefCtx = new JSpinner(new SpinnerNumberModel(XREF_CONTEXT_INSTRUCTIONS, 1, 64, 1));
             JSpinner spMaxOffset = new JSpinner(new SpinnerNumberModel(MAX_START_OFFSET, 1, 4096, 8));
+            JComboBox<String> cbWildcard = new JComboBox<>(new String[] { "?", "??" });
+            cbWildcard.setSelectedItem(WILDCARD);
 
             configPanel.add(new JLabel("Max instructions to scan:"));
             configPanel.add(spMaxInstr);
             configPanel.add(new JLabel("Min signature length (bytes):"));
             configPanel.add(spMinWindow);
+            configPanel.add(new JLabel("Min instructions in signature:"));
+            configPanel.add(spMinInstrWin);
             configPanel.add(new JLabel("Max signature length (bytes):"));
             configPanel.add(spMaxWindow);
             configPanel.add(new JLabel("Head check span (bytes):"));
@@ -188,6 +217,8 @@ public class Sigga extends GhidraScript {
             configPanel.add(spXrefCtx);
             configPanel.add(new JLabel("Max start offset (bytes):"));
             configPanel.add(spMaxOffset);
+            configPanel.add(new JLabel("Wildcard style:"));
+            configPanel.add(cbWildcard);
 
             cfgCustom.addActionListener(e -> { configPanel.setVisible(true); dialog.pack(); });
             cfgDefault.addActionListener(e -> { configPanel.setVisible(false); dialog.pack(); });
@@ -195,7 +226,12 @@ public class Sigga extends GhidraScript {
             // --- Center: combine mode + config ---
             JPanel centerPanel = new JPanel(new BorderLayout(0, 6));
             centerPanel.setBorder(BorderFactory.createEmptyBorder(0, 10, 0, 10));
-            centerPanel.add(modePanel, BorderLayout.NORTH);
+            
+            JPanel topSelectionPanel = new JPanel(new GridLayout(1, 2, 10, 0));
+            topSelectionPanel.add(modePanel);
+            topSelectionPanel.add(strategyPanel);
+            
+            centerPanel.add(topSelectionPanel, BorderLayout.NORTH);
             JPanel configWrapper = new JPanel(new BorderLayout(0, 4));
             configWrapper.add(configModePanel, BorderLayout.NORTH);
             configWrapper.add(configPanel, BorderLayout.CENTER);
@@ -208,6 +244,8 @@ public class Sigga extends GhidraScript {
             JButton cancelBtn = new JButton("Cancel");
             okBtn.addActionListener(e -> {
                 selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
+                SELECTED_STRATEGY = strategySkeleton.isSelected() ? MaskingStrategy.SKELETON : MaskingStrategy.SMART;
+                
                 if (cfgCustom.isSelected()) {
                     int minW = (int) spMinWindow.getValue();
                     int maxW = (int) spMaxWindow.getValue();
@@ -219,10 +257,12 @@ public class Sigga extends GhidraScript {
                     }
                     MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
                     MIN_WINDOW_BYTES = minW;
+                    MIN_WINDOW_INSTRUCTIONS = (int) spMinInstrWin.getValue();
                     MAX_WINDOW_BYTES = maxW;
                     HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
                     XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
                     MAX_START_OFFSET = (int) spMaxOffset.getValue();
+                    WILDCARD = (String) cbWildcard.getSelectedItem();
                 }
                 confirmed[0] = true;
                 dialog.dispose();
@@ -260,7 +300,18 @@ public class Sigga extends GhidraScript {
 
         List<Instruction> instructions = getInstructionsFrom(func.getBody(), startAddr, MAX_INSTRUCTIONS_TO_SCAN);
         
-        // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
+        if (SELECTED_STRATEGY == MaskingStrategy.SKELETON) {
+            monitor.setMessage("Scanning for Skeleton Signature...");
+            TokenData data = tokenizeInstructions(instructions, MaskProfile.SKELETON);
+            SigResult result = findCheapestSignature(data, startAddr);
+            if (result != null) {
+                result.tier = "Tier S (Skeleton / First-Byte-Only)";
+                finish(result);
+                return;
+            }
+            println("... Skeleton scan failed. Try increasing max instructions or using Smart mode.");
+        } else {
+            // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
         // We scan once with strict tokens. If we find a unique sig, we check its head.
         // If head is solid -> Tier 1. If head is weak -> Tier 2.
         monitor.setMessage("Scanning for Direct Signature...");
@@ -300,6 +351,7 @@ public class Sigga extends GhidraScript {
         popup("Failed to generate a unique signature. \n\n" +
               "This function appears to be identical to many others in the binary \n" +
               "and has no unique cross-references.");
+        }
     }
 
     private void finish(SigResult result) {
@@ -339,15 +391,21 @@ public class Sigga extends GhidraScript {
 
             StringBuilder sigBuilder = new StringBuilder();
             int byteCount = 0;
+            int instructionCount = 0;
 
             // Grow the window (j)
             for (int j = i; j < n; j++) {
+                if (data.instructionStartIndices.contains(j)) {
+                    instructionCount++;
+                }
+
                 String tok = tokens.get(j);
                 if (sigBuilder.length() > 0) sigBuilder.append(" ");
                 sigBuilder.append(tok);
                 byteCount++;
 
                 if (byteCount < MIN_WINDOW_BYTES) continue;
+                if (instructionCount < MIN_WINDOW_INSTRUCTIONS) continue;
                 if (byteCount > MAX_WINDOW_BYTES) break;
 
                 // 3. OPTIMIZATION: Only check uniqueness if we represent a full instruction.
@@ -362,7 +420,7 @@ public class Sigga extends GhidraScript {
                 // Check uniqueness
                 String currentSig = sigBuilder.toString();
                 if (isSignatureUnique(currentSig)) {
-                    // CLEANUP: Trim trailing wildcards if possible (e.g. "A B ? ?" -> "A B")
+                    // CLEANUP: Trim trailing wildcards if possible (e.g. "A B ?? ??" -> "A B")
                     String finalSig = trimTrailingWildcards(currentSig);
                     
                     // Found a unique sig. Classify it.
@@ -382,7 +440,7 @@ public class Sigga extends GhidraScript {
         int trimCount = 0;
         // Count trailing wildcards
         for (int i = parts.length - 1; i >= 0; i--) {
-            if (parts[i].equals("?")) trimCount++;
+            if (parts[i].equals(WILDCARD)) trimCount++;
             else break;
         }
         
@@ -407,13 +465,13 @@ public class Sigga extends GhidraScript {
         
         // RULE 1: The very first byte MUST be solid (Industry Standard)
         // This prevents signatures like "? 8B EC" which break some C++ scanners.
-        if (tokens.get(startIndex).contains("?")) return true;
+        if (tokens.get(startIndex).equals(WILDCARD)) return true;
         
         // RULE 2: Check density of the first few bytes
         int checkLen = Math.min(HEAD_CHECK_SPAN, tokens.size() - startIndex);
         int wildcards = 0;
         for (int k = 0; k < checkLen; k++) {
-            if (tokens.get(startIndex + k).contains("?")) wildcards++;
+            if (tokens.get(startIndex + k).equals(WILDCARD)) wildcards++;
         }
         // If more than 50% of the head is wildcards, consider it weak
         return wildcards > (checkLen / 2);
@@ -440,14 +498,21 @@ public class Sigga extends GhidraScript {
                 tokens[i] = String.format("%02X", bytes[i]);
             }
 
-            // 2. Mask relocations (absolute addresses are volatile)
-            maskRelocations(insn, tokens);
-            // 3. Mask branches (JMP/CALL/JCC) which always carry variable displacements
-            maskBranches(insn, tokens);
+            if (profile == MaskProfile.SKELETON) {
+                // Paranoid: Leave only the first byte, mask everything else in this instruction.
+                for (int i = 1; i < tokens.length; i++) {
+                    tokens[i] = WILDCARD;
+                }
+            } else {
+                // 2. Mask relocations (absolute addresses are volatile)
+                maskRelocations(insn, tokens);
+                // 3. Mask branches (JMP/CALL/JCC) which always carry variable displacements
+                maskBranches(insn, tokens);
 
-            if (profile == MaskProfile.STRICT) {
-                // 4. Aggressively mask operands that reference data/external symbols
-                maskOperandsSmart(insn, tokens);
+                if (profile == MaskProfile.STRICT) {
+                    // 4. Aggressively mask operands that reference data/external symbols
+                    maskOperandsSmart(insn, tokens);
+                }
             }
 
             for (String t : tokens) {
@@ -470,7 +535,7 @@ public class Sigga extends GhidraScript {
             // Default mask length 4
             int len = 4;
             for (int i = 0; i < len && (offset + i) < tokens.length; i++) {
-                tokens[offset + i] = "?";
+                tokens[offset + i] = WILDCARD;
             }
         }
     }
@@ -478,22 +543,22 @@ public class Sigga extends GhidraScript {
     private void maskBranches(Instruction insn, String[] tokens) {
         if (insn.getFlowType().isCall() || insn.getFlowType().isJump()) {
             // Safety check: if byte 0 was already masked by relocation, don't parse it
-            if (tokens[0].contains("?")) return;
+            if (tokens[0].equals(WILDCARD)) return;
 
             int b0 = Integer.parseInt(tokens[0], 16);
             // Heuristic: mask rel32 for CALL/JMP (E8/E9) to avoid volatile branch targets
             if (b0 == 0xE8 || b0 == 0xE9) {
-                for (int i = 1; i < tokens.length; i++) tokens[i] = "?";
+                for (int i = 1; i < tokens.length; i++) tokens[i] = WILDCARD;
             }
             // Short jumps (EB / 7x) – mask the displacement byte
             else if (tokens.length == 2 && (b0 == 0xEB || (b0 & 0xF0) == 0x70)) {
-                 tokens[1] = "?";
+                 tokens[1] = WILDCARD;
             }
             // Long conditional (0F 8x) – mask displacement dword
             else if (tokens.length >= 6 && b0 == 0x0F) {
                 // Safety check for 0F 8x check
-                if (!tokens[1].contains("?") && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
-                    for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
+                if (!tokens[1].equals(WILDCARD) && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
+                    for (int i = 2; i < tokens.length; i++) tokens[i] = WILDCARD;
                 }
             }
         }
@@ -578,7 +643,7 @@ public class Sigga extends GhidraScript {
             else { if (currentVal == value) match = true; }
 
             if (match) {
-                for (int k=0; k<size; k++) tokens[i+k] = "?";
+                for (int k=0; k<size; k++) tokens[i+k] = WILDCARD;
             }
         }
     }
